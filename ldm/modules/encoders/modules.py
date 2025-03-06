@@ -348,3 +348,82 @@ class CLIPEmbeddingNoiseAugmentation(ImageConcatWithNoiseAugmentation):
         z = self.unscale(z)
         noise_level = self.time_embed(noise_level)
         return z, noise_level
+
+
+class TextProjector(nn.Module):
+    """Projects text embeddings differently for each stage of the hierarchical diffusion"""
+    def __init__(self, in_dim=768, out_dim=768, style="global", num_heads=8):
+        super().__init__()
+        self.style = style
+        self.num_heads = num_heads
+        
+        if style == "global":
+            # Simple projection for global understanding
+            self.proj = nn.Sequential(
+                nn.Linear(in_dim, out_dim),
+                nn.LayerNorm(out_dim)
+            )
+        
+        elif style == "local":
+            # Multi-head attention based projection for local details
+            self.q_proj = nn.Linear(in_dim, out_dim)
+            self.k_proj = nn.Linear(in_dim, out_dim)
+            self.v_proj = nn.Linear(in_dim, out_dim)
+            self.out_proj = nn.Linear(out_dim, out_dim)
+            self.norm = nn.LayerNorm(out_dim)
+            
+        elif style == "detail":
+            # Enhanced multi-head attention with additional detail-focused layers
+            self.q_proj = nn.Linear(in_dim, out_dim)
+            self.k_proj = nn.Linear(in_dim, out_dim)
+            self.v_proj = nn.Linear(in_dim, out_dim)
+            self.out_proj = nn.Linear(out_dim, out_dim)
+            self.detail_enhance = nn.Sequential(
+                nn.Linear(out_dim, out_dim * 2),
+                nn.GELU(),
+                nn.Linear(out_dim * 2, out_dim),
+                nn.Dropout(0.1)
+            )
+            self.norm = nn.LayerNorm(out_dim)
+        
+        else:
+            raise ValueError(f"Unknown projection style: {style}")
+    
+    def forward(self, x):
+        if self.style == "global":
+            return self.proj(x)
+        
+        elif self.style == "local":
+            B, N, C = x.shape
+            head_dim = C // self.num_heads
+            scaling = float(head_dim) ** -0.5
+            
+            q = self.q_proj(x).view(B, N, self.num_heads, head_dim).transpose(1, 2)
+            k = self.k_proj(x).view(B, N, self.num_heads, head_dim).transpose(1, 2)
+            v = self.v_proj(x).view(B, N, self.num_heads, head_dim).transpose(1, 2)
+            
+            attn = (q @ k.transpose(-2, -1)) * scaling
+            attn = attn.softmax(dim=-1)
+            
+            x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+            x = self.out_proj(x)
+            x = self.norm(x)
+            return x
+            
+        elif self.style == "detail":
+            B, N, C = x.shape
+            head_dim = C // self.num_heads
+            scaling = float(head_dim) ** -0.5
+            
+            q = self.q_proj(x).view(B, N, self.num_heads, head_dim).transpose(1, 2)
+            k = self.k_proj(x).view(B, N, self.num_heads, head_dim).transpose(1, 2)
+            v = self.v_proj(x).view(B, N, self.num_heads, head_dim).transpose(1, 2)
+            
+            attn = (q @ k.transpose(-2, -1)) * scaling
+            attn = attn.softmax(dim=-1)
+            
+            x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+            x = self.out_proj(x)
+            x = self.detail_enhance(x)
+            x = self.norm(x)
+            return x

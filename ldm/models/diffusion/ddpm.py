@@ -1871,3 +1871,163 @@ class ImageEmbeddingConditionedLatentDiffusion(LatentDiffusion):
             x_samples_cfg = self.decode_first_stage(samples_cfg)
             log[f"samplescfg_scale_{unconditional_guidance_scale:.2f}"] = x_samples_cfg
         return log
+
+
+class HierarchicalLatentDiffusion(LatentDiffusion):
+    """Multi-stage hierarchical diffusion model that progressively refines patches"""
+    def __init__(self,
+                 stage_configs,  # list of dicts containing stage-specific configs
+                 patch_sizes,    # list of patch sizes for each stage (e.g., [1, 2, 4] for 1x1, 2x2, 4x4)
+                 *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.num_stages = len(stage_configs)
+        assert len(patch_sizes) == self.num_stages, "Must provide patch sizes for each stage"
+        self.patch_sizes = patch_sizes
+        
+        # Initialize text projectors for each stage
+        self.text_projectors = nn.ModuleList([
+            instantiate_from_config(stage_config.get("text_projector"))
+            for stage_config in stage_configs
+        ])
+        
+    def get_text_conditioning_for_stage(self, c, stage_idx):
+        """Project text conditioning for specific stage"""
+        assert stage_idx < self.num_stages
+        return self.text_projectors[stage_idx](c)
+    
+    def split_into_patches(self, x, patch_size):
+        """Split latent into patches"""
+        B, C, H, W = x.shape
+        assert H % patch_size == 0 and W % patch_size == 0, f"Image size {H}x{W} must be divisible by patch size {patch_size}"
+        
+        # Reshape into patches
+        patch_h = H // patch_size
+        patch_w = W // patch_size
+        x = x.reshape(B, C, patch_size, patch_h, patch_size, patch_w)
+        x = x.permute(0, 2, 4, 1, 3, 5)  # B, patch_size, patch_size, C, H//patch_size, W//patch_size
+        x = x.reshape(B * patch_size * patch_size, C, patch_h, patch_w)
+        return x
+    
+    def merge_patches(self, patches, patch_size, original_shape):
+        """Merge patches back into full image"""
+        B, C, H, W = original_shape
+        patch_h = H // patch_size
+        patch_w = W // patch_size
+        
+        # Reshape back to full image
+        patches = patches.reshape(-1, patch_size, patch_size, C, patch_h, patch_w)
+        patches = patches.permute(0, 3, 1, 4, 2, 5)  # B, C, patch_size, H//patch_size, patch_size, W//patch_size
+        patches = patches.reshape(B, C, H, W)
+        return patches
+    
+    def p_sample_hierarchical(self, x, c, t, stage_idx, clip_denoised=True):
+        """Sample for a specific stage, handling patch-wise processing"""
+        if stage_idx == 0:
+            # First stage: process whole image
+            return self.p_sample(x, c, t, clip_denoised=clip_denoised)
+        
+        # For later stages: process patches
+        patch_size = self.patch_sizes[stage_idx]
+        original_shape = x.shape
+        
+        # Split into patches
+        x_patches = self.split_into_patches(x, patch_size)
+        
+        # Repeat conditioning for each patch
+        c_repeated = {
+            k: v.repeat_interleave(patch_size * patch_size, dim=0) if isinstance(v, torch.Tensor) else v
+            for k, v in c.items()
+        }
+        
+        # Project text conditioning for this stage
+        c_repeated["c_crossattn"] = [self.get_text_conditioning_for_stage(c_repeated["c_crossattn"][0], stage_idx)]
+        
+        # Process each patch
+        denoised_patches = self.p_sample(x_patches, c_repeated, t, clip_denoised=clip_denoised)
+        
+        # Merge patches back
+        denoised = self.merge_patches(denoised_patches, patch_size, original_shape)
+        return denoised
+    
+    @torch.no_grad()
+    def p_sample_loop_hierarchical(self, cond, shape, stage_idx, return_intermediates=False,
+                                 x_T=None, verbose=True, callback=None, timesteps=None,
+                                 quantize_denoised=False, mask=None, x0=None, img_callback=None, 
+                                 start_T=None, log_every_t=None):
+        """Modified p_sample_loop for hierarchical sampling at a specific stage"""
+        if not log_every_t:
+            log_every_t = self.log_every_t
+        device = self.betas.device
+        b = shape[0]
+        
+        if x_T is None:
+            img = torch.randn(shape, device=device)
+        else:
+            img = x_T
+
+        intermediates = [img]
+        if timesteps is None:
+            timesteps = self.num_timesteps
+
+        if start_T is not None:
+            timesteps = min(timesteps, start_T)
+        iterator = tqdm(reversed(range(0, timesteps)), desc=f'Sampling t (Stage {stage_idx})', 
+                       total=timesteps) if verbose else reversed(range(0, timesteps))
+
+        for i in iterator:
+            ts = torch.full((b,), i, device=device, dtype=torch.long)
+            if self.shorten_cond_schedule:
+                assert self.model.conditioning_key != 'hybrid'
+                tc = self.cond_ids[ts].to(cond.device)
+                cond = self.q_sample(x_start=cond, t=tc, noise=torch.randn_like(cond))
+            
+            img = self.p_sample_hierarchical(img, cond, ts, stage_idx,
+                                           clip_denoised=self.clip_denoised)
+
+            if i % log_every_t == 0 or i == timesteps - 1:
+                intermediates.append(img)
+            if callback: callback(i)
+            if img_callback: img_callback(img, i)
+
+        if return_intermediates:
+            return img, intermediates
+        return img
+
+    @torch.no_grad()
+    def sample(self, cond, batch_size=16, return_intermediates=False, x_T=None,
+               verbose=True, timesteps=None, quantize_denoised=False,
+               mask=None, x0=None, shape=None, **kwargs):
+        """Multi-stage sampling process"""
+        if shape is None:
+            shape = (batch_size, self.channels, self.image_size, self.image_size)
+            
+        # Process conditioning
+        if cond is not None:
+            if isinstance(cond, dict):
+                cond = {key: cond[key][:batch_size] if not isinstance(cond[key], list) else
+                       list(map(lambda x: x[:batch_size], cond[key])) for key in cond}
+            else:
+                cond = [c[:batch_size] for c in cond] if isinstance(cond, list) else cond[:batch_size]
+        
+        # Multi-stage sampling
+        x = x_T
+        intermediates = []
+        
+        for stage in range(self.num_stages):
+            x, stage_intermediates = self.p_sample_loop_hierarchical(
+                cond=cond,
+                shape=shape,
+                stage_idx=stage,
+                return_intermediates=True,
+                x_T=x,
+                verbose=verbose,
+                timesteps=timesteps,
+                quantize_denoised=quantize_denoised,
+                mask=mask,
+                x0=x0
+            )
+            intermediates.extend(stage_intermediates)
+        
+        if return_intermediates:
+            return x, intermediates
+        return x
